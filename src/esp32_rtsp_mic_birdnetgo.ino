@@ -311,6 +311,22 @@ Biquad hpf;
 uint32_t hpfConfigSampleRate = 0;
 uint16_t hpfConfigCutoff = 0;
 
+// -- Clock-spur notch. At 48 kHz the capture chain carries a fixed tone at
+// exactly 3/19 * fs (7578.95 Hz), 55-62 dB above the noise floor. It is locked
+// to the sample clock (it moves with the sample rate, and is present with
+// either PDM clock edge), so it is a clock-generation artifact, not sound —
+// and because it is locked, its frequency is known exactly. Two cascaded RBJ
+// notches: one stage takes ~60 dB off the line itself but leaves its +/-1-10 Hz
+// phase-noise skirt above the floor; two stages put the skirt below it too,
+// for a ~155 Hz effective gap. Only at 48 kHz, the one rate where this spur was
+// measured (other rates have different spurs); always on, no setting.
+const uint32_t CLOCK_SPUR_NOTCH_RATE_HZ = 48000;
+const uint32_t CLOCK_SPUR_NOTCH_NUM = 3;
+const uint32_t CLOCK_SPUR_NOTCH_DEN = 19;
+const double CLOCK_SPUR_NOTCH_BW_HZ = 100.0;
+Biquad clockSpurNotch;             // coefficients; both stages share them
+bool clockSpurNotchActive = false; // published with hpf under hpfMux
+
 // -- Preferences for persistent settings
 Preferences audioPrefs;
 
@@ -546,6 +562,10 @@ String describeFilterChain() {
     chain += highpassEnabled
         ? (String(" (HPF ON @ ") + String(highpassCutoffHz) + " Hz)")
         : String(" (HPF bypassed)");
+    chain += (currentSampleRate == CLOCK_SPUR_NOTCH_RATE_HZ)
+        ? (String(", clock-spur notch @ ") +
+           String((float)currentSampleRate * CLOCK_SPUR_NOTCH_NUM / CLOCK_SPUR_NOTCH_DEN, 1) + " Hz")
+        : String(", clock-spur notch bypassed (non-48 kHz)");
     chain += noiseFilterEnabled
         ? String(", noise suppressor active")
         : String(", noise suppressor bypassed");
@@ -699,8 +719,31 @@ void updateHighpassCoeffs() {
         nextHpf.reset();
     }
 
+    // Clock-spur notch depends only on the sample rate, so it rides the same
+    // handoff: the Core 1 loop re-copies whenever hpfConfigSampleRate changes.
+    // Computed in double — float32 cos() would misplace the zero by ~10x more
+    // than the float32 coefficients themselves do (~0.0002 Hz).
+    Biquad nextNotch;
+    bool notchActive = (sampleRate == CLOCK_SPUR_NOTCH_RATE_HZ);
+    if (notchActive) {
+        const double fs = (double)sampleRate;
+        const double f0 = fs * (double)CLOCK_SPUR_NOTCH_NUM / (double)CLOCK_SPUR_NOTCH_DEN;
+        const double w0 = 2.0 * 3.14159265358979323846 * f0 / fs;
+        const double cosw0 = cos(w0);
+        const double alpha = sin(w0) / (2.0 * (f0 / CLOCK_SPUR_NOTCH_BW_HZ));
+        const double a0 = 1.0 + alpha;
+        nextNotch.b0 = (float)(1.0 / a0);
+        nextNotch.b1 = (float)(-2.0 * cosw0 / a0);
+        nextNotch.b2 = (float)(1.0 / a0);
+        nextNotch.a1 = (float)(-2.0 * cosw0 / a0);
+        nextNotch.a2 = (float)((1.0 - alpha) / a0);
+        nextNotch.reset();
+    }
+
     portENTER_CRITICAL(&hpfMux);
     hpf = nextHpf;
+    clockSpurNotch = nextNotch;
+    clockSpurNotchActive = notchActive;
     hpfConfigSampleRate = sampleRate;
     hpfConfigCutoff = cutoffHz;
     portEXIT_CRITICAL(&hpfMux);
@@ -1529,6 +1572,10 @@ void audioCaptureTask(void* parameter) {
 
     // High-pass filter state (local to this core)
     Biquad localHpf = hpf;
+    // Clock-spur notch: two stages, same coefficients, independent state
+    Biquad localNotchA = clockSpurNotch;
+    Biquad localNotchB = clockSpurNotch;
+    bool localNotchActive = clockSpurNotchActive;
     uint32_t localHpfConfigSampleRate = hpfConfigSampleRate;
     uint16_t localHpfConfigCutoff = hpfConfigCutoff;
     bool localHighpassEnabled = highpassEnabled;
@@ -1652,6 +1699,9 @@ void audioCaptureTask(void* parameter) {
             localHpfConfigCutoff != hpfConfigCutoff) {
             portENTER_CRITICAL(&hpfMux);
             localHpf = hpf;
+            localNotchA = clockSpurNotch;
+            localNotchB = clockSpurNotch;
+            localNotchActive = clockSpurNotchActive;
             localHpfConfigSampleRate = hpfConfigSampleRate;
             localHpfConfigCutoff = hpfConfigCutoff;
             localHighpassEnabled = highpassEnabled;
@@ -1715,10 +1765,14 @@ void audioCaptureTask(void* parameter) {
             localPdmDc = rawMean;
             localPdmDcInitialized = true;
             localHpf.reset();
+            localNotchA.reset();
+            localNotchB.reset();
         } else if (localUnsignedPdm && localUnsignedPdmConfidence <= PDM_UNSIGNED_CONFIDENCE_OFF) {
             localUnsignedPdm = false;
             localPdmDcInitialized = false;
             localHpf.reset();
+            localNotchA.reset();
+            localNotchB.reset();
         }
         if (localUnsignedPdm && !localPdmDcInitialized) {
             localPdmDc = rawMean;
@@ -1755,6 +1809,11 @@ void audioCaptureTask(void* parameter) {
 
             if (localHighpassEnabled) {
                 sample = localHpf.process(sample);
+            }
+            // Independent of the HPF toggle, and ahead of the noise suppressor,
+            // gain, limiter and AGC so none of them ever react to the spur.
+            if (localNotchActive) {
+                sample = localNotchB.process(localNotchA.process(sample));
             }
 
             float sampleAbs = fabsf(sample);
