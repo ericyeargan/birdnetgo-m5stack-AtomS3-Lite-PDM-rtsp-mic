@@ -142,7 +142,7 @@ Use `atoms3-lite-pdm-rtsp-mic-factory.bin` for first-time browser flashing. It i
 | Gain | 1.0x | Start conservative, raise only after checking the meter |
 | Buffer | 1024 samples | RTP chunking is capped internally at 1024 samples |
 | High-pass filter | On | 180 Hz cutoff by default; can be disabled for baseline testing |
-| Clock-spur notch | On at 48 kHz | Two-stage notch at exactly 3/19 × fs (7578.9 Hz), removing a fixed tone the capture clock injects at 48 kHz; bypassed at other rates |
+| Clock-spur canceller | On | Removes the pure tones the capture chain carries at exact fractions of fs (e.g. 5333 Hz or 7579 Hz at 48 kHz; which ones varies per I2S start) by subtracting the periodic component (period 171 / 165 / 21 / 21 samples at 48 / 24 / 32 / 16 kHz); ~0.16 Hz-wide notches, settles ~8 s after start |
 | Noise filter | Off | Optional steady-noise suppressor |
 | AGC | Off | Optional final gain rider for distant birds |
 | CPU | 160 MHz | Good thermal/performance balance |

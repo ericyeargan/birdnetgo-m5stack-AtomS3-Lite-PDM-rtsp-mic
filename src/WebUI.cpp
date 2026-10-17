@@ -75,6 +75,7 @@ extern uint8_t ledMode;
 extern volatile uint32_t i2sReadOkCount;
 extern volatile uint32_t i2sReadErrCount;
 extern volatile uint32_t i2sReadZeroCount;
+extern volatile uint32_t i2sDmaDroppedSamples;
 extern volatile uint16_t i2sLastSamplesRead;
 extern volatile int16_t i2sLastRawMin;
 extern volatile int16_t i2sLastRawMax;
@@ -765,6 +766,7 @@ static void httpAudioStatus() {
     json += "\"i2s_reads_ok\":" + String(i2sReadOkCount) + ",";
     json += "\"i2s_reads_err\":" + String(i2sReadErrCount) + ",";
     json += "\"i2s_reads_zero\":" + String(i2sReadZeroCount) + ",";
+    json += "\"i2s_dma_dropped_samples\":" + String(i2sDmaDroppedSamples) + ",";
     json += "\"i2s_last_samples\":" + String(lastSamplesRead) + ",";
     json += "\"i2s_raw_min\":" + String(rawMin) + ",";
     json += "\"i2s_raw_max\":" + String(rawMax) + ",";
