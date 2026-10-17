@@ -71,8 +71,14 @@ static inline void crossCoreMemoryBarrier() {
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
 #define FW_VERSION "4.1.0"
-// Expose FW version as a global C string for WebUI/API
-const char* FW_VERSION_STR = FW_VERSION;
+// Git revision generated at build time by scripts/git_version.py
+#if __has_include("GitVersion.h")
+#include "GitVersion.h"
+#else
+#define FW_GIT_REV "unknown"
+#endif
+// Expose FW version (with git revision) as a global C string for WebUI/API
+const char* FW_VERSION_STR = FW_VERSION "+" FW_GIT_REV;
 static const uint16_t OTA_PORT = 3232;
 static const char SETTINGS_NAMESPACE[] = "audioPrefs";
 static const char LEGACY_SETTINGS_NAMESPACE[] = "audio";
