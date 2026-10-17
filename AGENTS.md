@@ -28,6 +28,12 @@ See `README.md` for project documentation, features, architecture, and usage.
 - Use Xtensa `memw` memory barriers on critical flag transitions between cores
 - `core1OwnsLED` flag prevents concurrent FastLED/RMT driver access
 
+### Clock-spur canceller phase must stay locked to the sample count
+- The capture hardware adds pure tones at exact p/q × fs, picked anew at each I2S start; the canceller subtracts the N-sample periodic component (see `docs/CLOCK_SPURS.md`)
+- Its phase must advance once per captured sample — never skip, duplicate, or reorder samples ahead of it without adjusting the phase
+- Samples the I2S driver drops on DMA overflow are counted by the `on_recv_q_ovf` callback (`i2sDmaDroppedSamples`) and skipped over; keep that callback registered
+- Each period in `CLOCK_SPUR_CANCEL_PERIODS` must be a multiple of every tone denominator measured at that rate; re-survey before changing one
+
 ## Debugging Tips
 
 ### If Audio Stops Working

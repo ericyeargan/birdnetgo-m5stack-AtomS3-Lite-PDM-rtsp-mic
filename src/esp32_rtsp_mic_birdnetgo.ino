@@ -301,7 +301,7 @@ const uint16_t PDM_PROBE_SETTLE_MS = 650;
 const uint8_t PDM_PROBE_MEASURE_READS = 5;
 const char* DEVICE_TITLE = "M5 Atom RTSP Microphone";
 const char* DEVICE_INPUT_PROFILE = "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)";
-const char* FILTER_CHAIN_BASE = "PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
+const char* FILTER_CHAIN_BASE = "PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> clock-spur canceller -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
 
 // -- High-pass filter (biquad) to cut low-frequency rumble
 struct Biquad {
@@ -326,7 +326,8 @@ uint16_t hpfConfigCutoff = 0;
 // source isn't pinned down — likely the mic's sigma-delta modulator locking to
 // the PDM clock — but they are locked to the sample count to well under 1 ppm.
 // A fixed notch can't follow that, but every such line is periodic in exactly
-// N samples when its denominator divides N.
+// N samples when its denominator divides N. Full write-up and re-survey
+// procedure: docs/CLOCK_SPURS.md.
 // So: keep an exponential average of the input at each phase (sample index
 // mod N) and subtract it. Sound never repeats to the sample over seconds and
 // averages away; only sample-clock-locked lines build up. That gives a notch at

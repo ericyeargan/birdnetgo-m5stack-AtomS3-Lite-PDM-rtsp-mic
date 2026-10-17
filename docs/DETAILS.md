@@ -39,6 +39,7 @@ Core 1 **exclusively owns** the WiFiClient socket during streaming — Core 0 ne
 
 ### Active Filters
 - **High-pass filter**: optional 2nd-order Butterworth, roughly 12 dB/octave, default ON with a 180 Hz cutoff. Disable it temporarily when you need a raw baseline.
+- **Clock-spur canceller**: always on. Removes the pure tones the capture hardware adds at exact fractions of fs (which ones varies per I2S start) by subtracting the component that repeats every N samples (N set per rate). Settles about 8 s after each I2S start. See [CLOCK_SPURS.md](CLOCK_SPURS.md).
 - **Adaptive noise suppressor**: envelope follower + hold-time gate. This was retuned to stop the audible tap-tap artifact that happened when gain changed too abruptly as the live dB meter fell.
 - **I2S gap concealment**: short capture stalls are bridged with de-clicked fallback audio, and the next valid block is ramped in to avoid a hard segment-edge tap.
 - **Limiter**: catches peaks before full-scale clipping.

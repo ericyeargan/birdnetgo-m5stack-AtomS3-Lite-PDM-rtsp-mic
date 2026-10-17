@@ -155,13 +155,14 @@ Use `atoms3-lite-pdm-rtsp-mic-factory.bin` for first-time browser flashing. It i
 The live stream path is:
 
 ```text
-PDM PCM -> stable DC normalize when needed -> 2nd-order high-pass by default -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC -> RTP/Web preview
+PDM PCM -> stable DC normalize when needed -> 2nd-order high-pass by default -> clock-spur canceller -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC -> RTP/Web preview
 ```
 
 Key points:
 
 - PDM capture uses ESP32 I2S PDM RX mode, 16-bit mono.
 - Low-amplitude unsigned PDM blocks are centered with a slow DC tracker before gain.
+- The clock-spur canceller removes the steady pure tones the capture hardware adds at exact fractions of the sample rate. Which tones appear changes with every I2S start; see [docs/CLOCK_SPURS.md](docs/CLOCK_SPURS.md).
 - The limiter catches sudden peaks before full-scale clipping.
 - Short I2S read stalls are bridged with de-clicked concealment blocks, then the next real block is ramped in to avoid a hard edge.
 - AGC runs after the cleanup stages and is intentionally capped so it does not turn quiet mic bed noise into constant hiss.
@@ -239,6 +240,14 @@ Return to a clean baseline:
 Then re-enable features one at a time. The noise filter and AGC are useful outdoors, but they can exaggerate a weak or poorly centered signal if enabled too early.
 If `/api/audio_status` shows `i2s_unsigned_pcm: true`, the firmware is recentering an all-positive PDM stream before gain; the lower rates above are the cleanest baseline for checking whether the raspiness is coming from the mic path versus later DSP stages.
 
+### Steady Whistle Or Pure Tone
+
+A constant tone at a fixed pitch (for example 5333 Hz or 7579 Hz at 48 kHz) that isn't in the room is a clock-locked tone from the capture hardware. The clock-spur canceller removes the known ones about 8 s after each I2S start. If one persists:
+
+- Wait 10 s after a reboot, I2S restart or sample-rate change.
+- Check `i2s_dma_dropped_samples` in `/api/audio_status`. Frequent overflows are handled, but they point to a stalled audio loop.
+- Measure the tone's exact frequency with `scripts/find_locked_tones.py`. If it's a fraction of fs that the current period doesn't cover, follow [docs/CLOCK_SPURS.md](docs/CLOCK_SPURS.md) to add it.
+
 ### Clipping
 
 If the Web UI meter is red or `clip_count` rises quickly:
@@ -291,9 +300,11 @@ The upstream `m5stack/M5Atom` dependency is intentionally not used in this fork 
 | `src/WebUIAssets.h` | Generated Web UI asset bundle |
 | `webui/` | Vite/Preact source for the newer UI bundle |
 | `scripts/build_webui.py` | Converts the built web UI into `src/WebUIAssets.h` |
+| `scripts/find_locked_tones.py` | Lists clock-locked tones in a WAV capture (for clock-spur surveys) |
 | `platformio.ini` | AtomS3 Lite USB and OTA build environments |
 | `partitions_ota.csv` | OTA-capable partition table |
 | `docs/DETAILS.md` | Deeper architecture and troubleshooting notes |
+| `docs/CLOCK_SPURS.md` | Clock-locked tones: measurements, suspected cause, canceller design, re-survey procedure |
 
 ## Acknowledgments
 
