@@ -2,9 +2,11 @@
 
 The capture chain (AtomS3 Lite + Unit Mini PDM / SPM1423) carries steady pure
 tones at exact fractions of the sample rate. Which tones appear is re-chosen
-every time the I2S channel starts. The firmware removes them with a periodic
-canceller. This page records what is known, what the mitigation does, and how
-to re-measure.
+every time the I2S channel starts. They start as an ultrasonic tone in the
+mic's own output, which the ESP32-S3's hardware PDM-to-PCM filter folds into
+the audio band (see [Cause](#cause)). The firmware removes them with a
+periodic canceller. This page records what is known, what the mitigation
+does, and how to re-measure.
 
 ## Symptom
 
@@ -53,38 +55,178 @@ Properties that hold for every line measured:
 - **Not produced by firmware DSP.** The firmware filters run in float32, which
   can't produce a self-sustaining tone like this.
 
-## Cause (not confirmed)
+## Cause
 
-The tones come from the capture hardware, not from sound, and not from the
-firmware. Which chip generates them is still open.
+Measured October 2026 at 48 kHz. The mic's PDM output always carries a steady
+ultrasonic tone, and the ESP32-S3's hardware PDM-to-PCM filter doesn't reject
+it well enough. The filter folds it to 48 kHz − f, which puts it in the audio
+band.
 
-- **Most likely: sigma-delta idle tones in the mic.** A 1-bit PDM modulator with
-  near-silent input can fall into a repeating pattern locked to its clock. That
-  fits exact fractions of fs, a pattern picked when the clock starts, and
-  independence from the sampling edge.
-- **The always-present 1/3 × fs line at 48 kHz has a likely explanation.** The
-  ESP32-S3 makes the 48 kHz PDM clock as 160 MHz ÷ (6 + 49/96). That division
-  isn't a whole number, so the clock period jitters in a pattern that repeats
-  every 96 MCLK cycles, which is exactly 3 samples. That predicts a fixed line at
-  fs/3. No such line was seen at 24 kHz, where the same reasoning also predicts
-  one.
-- **Disproven: the mic locks onto that 3-sample divider pattern.** That idea
-  predicted every period would be a multiple of 3. The 48 kHz periods (9 and 57)
-  fit, but 24 kHz (5 and 33) and 32 kHz (7) don't.
-- **Ruled out: a fixed external interferer.** It would land at different
-  fractions of fs at each rate, not at small-denominator fractions at every rate.
+### What was measured
 
-Two hardware tests would settle where the tones come from:
+The test used temporary diagnostic firmware. It added an endpoint that captured
+the mic's raw 1-bit stream with the hardware filter bypassed
+(`I2S_PDM_DATA_FMT_RAW`, PDM clock 3.072 MHz), plus a runtime canceller bypass.
+That firmware is not in the tree. The raw stream was decoded on a PC. The
+decoder was an exact integer CIC filter decimating by 64, which can't create
+tones. Each capture was a fresh clock start. Normal hardware-filtered captures
+were interleaved with them, with the canceller bypassed. Both paths were
+analysed on identical 2907-sample (17 × 171) segments. They have the same
+absolute scale: about −106 dBFS floor per bin near 5 kHz.
 
-1. Hold loud broadband noise (hiss, running water) at the mic while a strong mode
-   is active. If the line smears or vanishes, it's the mic's modulator; if it
-   stays put, it's interference added to the signal.
-2. Disconnect or ground the PDM DATA line. If the lines persist, the source is
-   on the ESP32 side.
+| | Hardware PDM2PCM path | Raw bitstream, decoded on the PC |
+| --- | --- | --- |
+| 3/19 or 1/9 × fs line | 10 of 10 starts, at −77 or −82 dBFS | 0 of 8 starts, at the floor (about −107 dBFS) |
+| Ultrasonic tone | (filtered) | 14 of 14 captures: fclk/76 = 40.42 kHz (7 of 11 quiet starts) or fclk/72 = 42.67 kHz (4 of 11) |
 
-A web search (October 2026) found no reports of this behaviour for the SPM1423,
-the Unit Mini PDM, or ESP32-S3 PDM capture. Most users run this mic at 16 kHz,
-where the lines are under 0.1 LSB.
+The ultrasonic tone accounts for every property listed above:
+
+- **Exact fractions of fs.** fs = fclk/64, so the folded tone sits at
+  fs × (1 − 64/N). N = 76 gives 3/19 × fs (7578.9 Hz, mode A), and N = 72 gives
+  1/9 × fs (5333.3 Hz, mode B).
+- **The companion lines.** The tone has a 3rd harmonic, 8.4–9.5 dB down (121.26
+  or 128 kHz). It folds to 9/19 × fs (= 27/57, a mode A companion) or 1/3 × fs.
+  The 2nd harmonic is 38–47 dB down. Strong odd harmonics with weak even ones
+  fit a square-ish wave.
+- **Re-chosen at each I2S start.** Each clock start settles on N = 72 or N = 76,
+  at about the same split as modes A and B.
+- **Same amplitude every time.** The tone was −43.9 dBFS in every capture, in
+  both modes. The ESP32 filter passes it at −77 or −82 dBFS, which is only
+  33–38 dB of rejection. For comparison, a plain 5th-order CIC decimator gives
+  about 74 dB at 40 kHz. Espressif doesn't document the filter's stopband. It is
+  adequate for a mic whose ultrasonic output is just its own noise, but not for
+  this one.
+- **Independent of the probe result.** Both PDM slots (clock edges) carry the
+  identical tone.
+
+### Noise test
+
+White noise from a speaker raised the in-band level at the mic by about 35 dB,
+to −35 dBFS rms. The ultrasonic tone stayed at exactly −43.9 dBFS and the same
+frequency. A sigma-delta idle tone would have broken up under that much input.
+So this is a fixed periodic signal added inside the mic module. Likely an
+on-chip circuit is clocked from a divided PDM clock, but the datasheet doesn't
+say, and that part is inference.
+
+### PDM clock sweep
+
+Raw captures were taken at seven PDM clocks, with 2–5 clock starts each. Some
+HTTP fetches failed, so some rates have fewer starts. The hardware PCM path
+runs the PDM clock at 64 × fs, so four of these clocks are the ones used at
+16, 24, 32 and 48 kHz.
+
+| PDM clock (rate) | N, chosen per start | Tone | Folds to (hardware path) |
+| --- | --- | --- | --- |
+| 1.024 MHz (16 kHz) | 24 or 28 | 42.67 / 36.57 kHz | 1/3 or 2/7 × fs |
+| 1.536 MHz (24 kHz) | 40 or 44 | 38.40 / 34.91 kHz | 2/5 or 5/11 × fs |
+| 2.048 MHz (32 kHz) | 48 or 56 | 42.67 / 36.57 kHz | 1/3 or 1/7 × fs |
+| 2.4 MHz | 56 or 64 | 42.86 / 37.51 kHz | — |
+| 2.8 MHz | 64 | 43.75 kHz | — |
+| 3.072 MHz (48 kHz) | 72 or 76 | 42.67 / 40.43 kHz | 1/9 or 3/19 × fs |
+| 3.2 MHz | 72 or 80 | 44.44 / 40.00 kHz | — |
+
+- **Every line in the [Measurements](#measurements) table is predicted.** At
+  each supported rate, the two values of N give exactly the two main lines seen
+  there. The one exception is 16/33 at 24 kHz, which is still unexplained.
+- **The mic aims for a frequency.** N changes with the clock so the tone always
+  lands at 35–44 kHz. A fixed divider would not do that.
+- **N is always a multiple of 4.** The tone is fclk/4 divided by a whole number
+  M. At startup M lands on one of two values, sometimes adjacent and sometimes
+  two apart. There aren't enough starts to work out the selection rule.
+- **The level is −43 to −45 dBFS at every clock.**
+- **Unrelated lines.** Weak lines at 24.50 and 24.80 kHz, about −84 dBFS, were
+  present at every clock. They stay at the same frequency whatever the clock,
+  so they don't come from it. At 48 kHz they alias to about 23.2–23.5 kHz, which
+  is outside BirdNET's range.
+
+### Ruled out
+
+- **Mic modulator idle tones** (the earlier leading theory). They would change
+  with acoustic input.
+- **The ESP32-S3 fractional clock divider.** Raw mode uses a different MCLK
+  divider and still shows the same 72 and 76 periods.
+- **Limit cycles or arithmetic in the ESP32 PDM2PCM filter.** Decoding the raw
+  bits outside the chip leaves the ultrasonic tone and no in-band line, so no
+  in-band line comes out of the filter's internals.
+- **A fixed external interferer.** It would land at different fractions of fs
+  at each rate.
+- **The mic's supply regulator.** The Unit Mini PDM makes its 3.3 V with an
+  HT7533, a linear regulator. It has no clock, so it can't produce a tone that is
+  a whole number of PDM clocks long and re-chosen at each start. It could still
+  change the tone's level. A low-quiescent-current regulator like this one
+  typically has a slow control loop, so current pulses from the mic or ripple
+  on the 5 V input would reach the 3.3 V rail at tens of kHz with little
+  attenuation.
+
+### Possible sources inside the mic
+
+The evidence points to something in the mic held just above the audio band at
+a fixed level, timed from the PDM clock. Ranked by fit:
+
+1. **Deliberate out-of-band dither.** Some sigma-delta designs inject a
+   constant ultrasonic signal to stop idle tones from forming, and expect the
+   decimator to remove it. That fits every observation.
+2. **Charge-pump or bias-generator ripple.** The MEMS bias voltage is made by an
+   on-chip charge pump. If the pump runs from a divided PDM clock, its ripple
+   could appear in the output at a constant level. Charge pumps normally run
+   much faster than 35–44 kHz, so this fits less well.
+3. **Other on-chip clocked logic.** An example is clock-rate detection whose
+   activity couples into the front end. Choosing between two divider values at
+   each start looks like a startup measurement of the clock against an internal
+   oscillator.
+
+**A supply check would separate 1 from 2.** With an oscilloscope or a 192 kHz
+audio interface, look at the Unit Mini PDM's 3.3 V rail at the mic's decoupling
+capacitor, or better, at the current through a 10 Ω shunt in the Grove 5 V
+line. Then check whether a 35–44 kHz line on the supply moves with the mode:
+- At 48 kHz, a 7579 Hz line in the stream (canceller bypassed) means N = 76, so
+  the tone is at 40.43 kHz. A 5333 Hz line means N = 72, so it is at 42.67 kHz.
+- `reset_i2s` re-chooses the mode, so repeat it to see the supply line jump
+  between the two.
+- Changing the sample rate moves the tone as in the sweep table.
+
+How to read the result:
+- **A line that tracks the mode and the rate** means on-chip switching, so
+  candidate 2.
+- **No line** fits dither, but it could also be a well-decoupled internal pump.
+
+Controls:
+- Compare the ESP32's 3.3 V rail.
+- Stop the clock, which puts the mic to sleep. The line should disappear.
+
+To rule out the HT7533 completely, power the mic from a clean external 3.3 V
+supply. If the tone stays at −44 dBFS with the same N, the regulator plays no
+part.
+
+### Not yet measured
+
+- **The 1 kHz grid** is too weak to see in 61 ms raw captures. Its source is
+  still unknown.
+- **A second Unit Mini PDM or another mic model.** Without one, it isn't known
+  whether this is a design property of the SPM1423 or a fault in this unit.
+
+### Consequences for mitigation
+
+The tone is already in the mic's output, so it can't be removed by changing
+how the ESP32 is configured. There are two ways to stop it at the source:
+
+- Decimate the raw PDM in firmware with a filter that rejects 28 kHz and above
+  by at least 50 dB. The tone is at 35 kHz or above at every rate, well clear of
+  the audio band.
+- Use a different mic.
+
+Otherwise the periodic canceller below remains the right tool.
+
+### Raw PDM format (ESP32-S3, ESP-IDF 5.5)
+
+- `sample_rate_hz` is the PDM clock.
+- Even with `I2S_SLOT_MODE_MONO`, DMA delivers two interleaved 16-bit slots,
+  one per clock edge. At 3.072 MHz that is 768 kB/s.
+- Each slot is a little-endian uint16 with the bits MSB-first in time.
+- An exact CIC filter decimating by 64 gives the same dBFS scale as the
+  hardware path.
+- With 4 DMA descriptors the largest contiguous heap block is about 48 kB,
+  which is about 61 ms of audio per capture.
 
 ## Mitigation: periodic canceller
 

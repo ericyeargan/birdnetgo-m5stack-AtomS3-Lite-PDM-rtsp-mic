@@ -322,9 +322,11 @@ uint16_t hpfConfigCutoff = 0;
 
 // -- Clock-spur canceller. At every supported rate the capture chain carries
 // pure tones at exact fractions of fs, and which ones appear is re-chosen at
-// every I2S start (see CLOCK_SPUR_CANCEL_PERIODS for the modes measured). Their
-// source isn't pinned down — likely the mic's sigma-delta modulator locking to
-// the PDM clock — but they are locked to the sample count to well under 1 ppm.
+// every I2S start (see CLOCK_SPUR_CANCEL_PERIODS for the modes measured). The
+// mic outputs an ultrasonic tone at an exact submultiple of the PDM clock (e.g.
+// fclk/72 or fclk/76 at 48 kHz, re-chosen per clock start to stay at 35-44 kHz),
+// and the ESP32-S3 PDM2PCM filter folds it into the band, so the lines are
+// locked to the sample count to well under 1 ppm.
 // A fixed notch can't follow that, but every such line is periodic in exactly
 // N samples when its denominator divides N. Full write-up and re-survey
 // procedure: docs/CLOCK_SPURS.md.
