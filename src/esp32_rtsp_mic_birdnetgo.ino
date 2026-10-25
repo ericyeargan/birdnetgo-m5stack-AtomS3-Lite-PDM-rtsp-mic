@@ -71,8 +71,14 @@ static inline void crossCoreMemoryBarrier() {
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
 #define FW_VERSION "4.1.0"
-// Expose FW version as a global C string for WebUI/API
-const char* FW_VERSION_STR = FW_VERSION;
+// Git revision generated at build time by scripts/git_version.py
+#if __has_include("GitVersion.h")
+#include "GitVersion.h"
+#else
+#define FW_GIT_REV "unknown"
+#endif
+// Expose FW version (with git revision) as a global C string for WebUI/API
+const char* FW_VERSION_STR = FW_VERSION "+" FW_GIT_REV;
 static const uint16_t OTA_PORT = 3232;
 static const char SETTINGS_NAMESPACE[] = "audioPrefs";
 static const char LEGACY_SETTINGS_NAMESPACE[] = "audio";
@@ -201,6 +207,9 @@ unsigned long peakHoldUntilMs = 0; // when to clear hold
 volatile uint32_t i2sReadOkCount = 0;
 volatile uint32_t i2sReadErrCount = 0;
 volatile uint32_t i2sReadZeroCount = 0;
+// Samples the I2S driver discarded because its DMA queue was full (reader too
+// slow). Written only by the DMA ISR; lets Core 1 keep sample-locked DSP in step.
+volatile uint32_t i2sDmaDroppedSamples = 0;
 volatile uint16_t i2sLastSamplesRead = 0;
 volatile int16_t i2sLastRawMin = 0;
 volatile int16_t i2sLastRawMax = 0;
@@ -292,7 +301,7 @@ const uint16_t PDM_PROBE_SETTLE_MS = 650;
 const uint8_t PDM_PROBE_MEASURE_READS = 5;
 const char* DEVICE_TITLE = "M5 Atom RTSP Microphone";
 const char* DEVICE_INPUT_PROFILE = "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)";
-const char* FILTER_CHAIN_BASE = "PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
+const char* FILTER_CHAIN_BASE = "PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> clock-spur canceller -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
 
 // -- High-pass filter (biquad) to cut low-frequency rumble
 struct Biquad {
@@ -310,6 +319,58 @@ uint16_t highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
 Biquad hpf;
 uint32_t hpfConfigSampleRate = 0;
 uint16_t hpfConfigCutoff = 0;
+
+// -- Clock-spur canceller. At every supported rate the capture chain carries
+// pure tones at exact fractions of fs, and which ones appear is re-chosen at
+// every I2S start (see CLOCK_SPUR_CANCEL_PERIODS for the modes measured). The
+// mic outputs an ultrasonic tone at an exact submultiple of the PDM clock (e.g.
+// fclk/72 or fclk/76 at 48 kHz, re-chosen per clock start to stay at 35-44 kHz),
+// and the ESP32-S3 PDM2PCM filter folds it into the band, so the lines are
+// locked to the sample count to well under 1 ppm.
+// A fixed notch can't follow that, but every such line is periodic in exactly
+// N samples when its denominator divides N. Full write-up and re-survey
+// procedure: docs/CLOCK_SPURS.md.
+// So: keep an exponential average of the input at each phase (sample index
+// mod N) and subtract it. Sound never repeats to the sample over seconds and
+// averages away; only sample-clock-locked lines build up. That gives a notch at
+// every k * fs/N, each ~1/(pi*tau) Hz wide (~0.16 Hz at tau = 2 s), ~14 Hz in
+// total at N = 171. On the device at 48 kHz: every line back to the floor
+// ~8 s after each I2S start, in both modes. Always on.
+//
+// Periods cover every mode seen in 8-13 I2S starts per rate; a rarer mode with
+// another denominator would pass through. Not covered anywhere: a weak (+12-18
+// dB) grid of exact 1 kHz multiples, which would need N to be a multiple of
+// fs/1000 as well (2736 at 48 kHz).
+struct ClockSpurPeriod {
+    uint32_t sampleRate;
+    uint16_t period;
+};
+constexpr ClockSpurPeriod CLOCK_SPUR_CANCEL_PERIODS[] = {
+    {48000, 171},  // 1/9, or 9/57 (= 3/19), 16/57, 25/57, 27/57; and 1/3
+    {32000, 21},   // 1/3 or 1/7
+    {24000, 165},  // 2/5, or 5/11 with 16/33
+    {16000, 21},   // 2/7 or 1/3 (weak: +16-24 dB, under 0.1 LSB)
+};
+constexpr uint16_t CLOCK_SPUR_CANCEL_MAX_PERIOD = 171;
+const float CLOCK_SPUR_CANCEL_TAU_S = 2.0f;       // converges in ~3 tau after start
+float clockSpurAcc[CLOCK_SPUR_CANCEL_MAX_PERIOD]; // Core 1 only (audio task)
+// Published with hpf under hpfMux; period 0 = bypassed
+uint16_t clockSpurPeriod = 0;
+float clockSpurRate = 0.0f;        // per-visit averaging rate, N / (tau * fs)
+
+constexpr bool clockSpurPeriodsFit(size_t i = 0) {
+    return i >= sizeof(CLOCK_SPUR_CANCEL_PERIODS) / sizeof(CLOCK_SPUR_CANCEL_PERIODS[0]) ||
+           (CLOCK_SPUR_CANCEL_PERIODS[i].period <= CLOCK_SPUR_CANCEL_MAX_PERIOD &&
+            clockSpurPeriodsFit(i + 1));
+}
+static_assert(clockSpurPeriodsFit(), "clock-spur period exceeds CLOCK_SPUR_CANCEL_MAX_PERIOD");
+
+uint16_t clockSpurPeriodForSampleRate(uint32_t sampleRate) {
+    for (const ClockSpurPeriod& entry : CLOCK_SPUR_CANCEL_PERIODS) {
+        if (entry.sampleRate == sampleRate) return entry.period;
+    }
+    return 0;
+}
 
 // -- Preferences for persistent settings
 Preferences audioPrefs;
@@ -546,6 +607,10 @@ String describeFilterChain() {
     chain += highpassEnabled
         ? (String(" (HPF ON @ ") + String(highpassCutoffHz) + " Hz)")
         : String(" (HPF bypassed)");
+    uint16_t spurPeriod = clockSpurPeriodForSampleRate(currentSampleRate);
+    chain += spurPeriod
+        ? (String(", clock-spur canceller (period ") + String(spurPeriod) + " samples)")
+        : String(", clock-spur canceller bypassed (no period for this rate)");
     chain += noiseFilterEnabled
         ? String(", noise suppressor active")
         : String(", noise suppressor bypassed");
@@ -699,8 +764,17 @@ void updateHighpassCoeffs() {
         nextHpf.reset();
     }
 
+    // Clock-spur canceller depends only on the sample rate, so it rides the
+    // same handoff: the Core 1 loop re-reads whenever hpfConfigSampleRate changes.
+    uint16_t spurPeriod = clockSpurPeriodForSampleRate(sampleRate);
+    float spurRate = spurPeriod
+        ? (float)spurPeriod / (CLOCK_SPUR_CANCEL_TAU_S * (float)sampleRate)
+        : 0.0f;
+
     portENTER_CRITICAL(&hpfMux);
     hpf = nextHpf;
+    clockSpurPeriod = spurPeriod;
+    clockSpurRate = spurRate;
     hpfConfigSampleRate = sampleRate;
     hpfConfigCutoff = cutoffHz;
     portEXIT_CRITICAL(&hpfMux);
@@ -1529,6 +1603,19 @@ void audioCaptureTask(void* parameter) {
 
     // High-pass filter state (local to this core)
     Biquad localHpf = hpf;
+    // Clock-spur canceller: per-phase averages live in clockSpurAcc (this core
+    // only). The phase must advance with every sample to stay locked to fs, so
+    // samples the driver drops on DMA overflow are skipped over too; without
+    // that, a stalled loop slips the phase and the lines return for ~3 tau.
+    uint16_t localSpurPeriod = clockSpurPeriod;
+    float localSpurRate = clockSpurRate;
+    uint16_t localSpurPhase = 0;
+    uint32_t localDmaDroppedSamples = i2sDmaDroppedSamples;
+    auto resetSpurCanceller = [&]() {
+        memset(clockSpurAcc, 0, sizeof(clockSpurAcc));
+        localSpurPhase = 0;
+    };
+    resetSpurCanceller();
     uint32_t localHpfConfigSampleRate = hpfConfigSampleRate;
     uint16_t localHpfConfigCutoff = hpfConfigCutoff;
     bool localHighpassEnabled = highpassEnabled;
@@ -1641,6 +1728,16 @@ void audioCaptureTask(void* parameter) {
         i2sReadOkCount = i2sReadOkCount + 1U;
         lastGoodCaptureMs = millis();
         uint16_t samplesRead = bytesRead / sizeof(int16_t);
+        uint32_t droppedNow = i2sDmaDroppedSamples;
+        if (droppedNow != localDmaDroppedSamples) {
+            // Dropped buffers are always older than this read, so they belong
+            // before its first sample.
+            if (localSpurPeriod) {
+                localSpurPhase = (uint16_t)((localSpurPhase +
+                    (droppedNow - localDmaDroppedSamples) % localSpurPeriod) % localSpurPeriod);
+            }
+            localDmaDroppedSamples = droppedNow;
+        }
         portENTER_CRITICAL(&diagMux);
         i2sLastGapMs = 0;
         i2sLastSamplesRead = samplesRead;
@@ -1652,10 +1749,19 @@ void audioCaptureTask(void* parameter) {
             localHpfConfigCutoff != hpfConfigCutoff) {
             portENTER_CRITICAL(&hpfMux);
             localHpf = hpf;
+            uint16_t newSpurPeriod = clockSpurPeriod;
+            float newSpurRate = clockSpurRate;
             localHpfConfigSampleRate = hpfConfigSampleRate;
             localHpfConfigCutoff = hpfConfigCutoff;
             localHighpassEnabled = highpassEnabled;
             portEXIT_CRITICAL(&hpfMux);
+            // An HPF retune only reshapes the lines; the averages re-converge
+            // on their own. Only a period or sample-rate change invalidates them.
+            if (newSpurPeriod != localSpurPeriod || newSpurRate != localSpurRate) {
+                localSpurPeriod = newSpurPeriod;
+                localSpurRate = newSpurRate;
+                resetSpurCanceller();
+            }
         }
 
         // Determine effective gain (manual * AGC if enabled)
@@ -1715,10 +1821,12 @@ void audioCaptureTask(void* parameter) {
             localPdmDc = rawMean;
             localPdmDcInitialized = true;
             localHpf.reset();
+            resetSpurCanceller();  // input scale changed; old averages are wrong
         } else if (localUnsignedPdm && localUnsignedPdmConfidence <= PDM_UNSIGNED_CONFIDENCE_OFF) {
             localUnsignedPdm = false;
             localPdmDcInitialized = false;
             localHpf.reset();
+            resetSpurCanceller();  // input scale changed; old averages are wrong
         }
         if (localUnsignedPdm && !localPdmDcInitialized) {
             localPdmDc = rawMean;
@@ -1755,6 +1863,14 @@ void audioCaptureTask(void* parameter) {
 
             if (localHighpassEnabled) {
                 sample = localHpf.process(sample);
+            }
+            // Independent of the HPF toggle, and ahead of the noise suppressor,
+            // gain, limiter and AGC so none of them ever react to the spurs.
+            if (localSpurPeriod) {
+                float& avg = clockSpurAcc[localSpurPhase];
+                avg += (sample - avg) * localSpurRate;
+                sample -= avg;
+                if (++localSpurPhase >= localSpurPeriod) localSpurPhase = 0;
             }
 
             float sampleAbs = fabsf(sample);
@@ -2140,6 +2256,13 @@ static i2s_pdm_slot_mask_t pdmLine0SlotMask(bool useLeftSlot) {
 #endif
 }
 
+static bool IRAM_ATTR onI2sRecvQueueOverflow(i2s_chan_handle_t handle, i2s_event_data_t* event, void* userCtx) {
+    (void)handle;
+    (void)userCtx;
+    i2sDmaDroppedSamples = i2sDmaDroppedSamples + (uint32_t)(event->size / sizeof(int16_t));
+    return false;
+}
+
 static bool setupModernPdmDriverCandidate(uint16_t dmaBufLen, uint8_t dmaBufCount,
                                           bool useLeftSlot, bool clkInvert,
                                           bool verboseLogs) {
@@ -2190,6 +2313,15 @@ static bool setupModernPdmDriverCandidate(uint16_t dmaBufLen, uint8_t dmaBufCoun
         }
         shutdownModernI2sDriver();
         return false;
+    }
+
+    // Count the samples the driver drops on DMA queue overflow, so the
+    // clock-spur canceller can advance its phase past them.
+    i2s_event_callbacks_t callbacks = {};
+    callbacks.on_recv_q_ovf = onI2sRecvQueueOverflow;
+    err = i2s_channel_register_event_callback(i2sRxChannel, &callbacks, NULL);
+    if (err != ESP_OK && verboseLogs) {
+        simplePrintln("WARNING: I2S overflow callback not registered: " + String(esp_err_to_name(err)));
     }
 
     err = i2s_channel_enable(i2sRxChannel);
