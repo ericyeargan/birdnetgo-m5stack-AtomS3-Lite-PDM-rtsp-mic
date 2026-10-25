@@ -99,9 +99,9 @@ static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000
 #define OVERHEAT_LIMIT_STEP_C 5
 
 // -- Pins (AtomS3 Lite + Unit Mini PDM)
-// M5's reference wiring for the PDM Unit is CLK=G1 and DATA=G2.
-#define I2S_CLK_PIN      1  // PDM CLK (G1)
-#define I2S_DATA_IN_PIN  2  // PDM DATA (G2)
+// Mic wired to the header pins (M5's Grove reference wiring is CLK=G1, DATA=G2).
+#define I2S_CLK_PIN     39  // PDM CLK (G39)
+#define I2S_DATA_IN_PIN 38  // PDM DATA (G38)
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
 struct CRGB {

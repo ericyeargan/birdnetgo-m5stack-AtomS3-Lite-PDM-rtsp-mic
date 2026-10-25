@@ -784,7 +784,7 @@ static void httpAudioStatus() {
     if (!driverOk) {
         i2sHint = "I2S driver setup failed. Check serial logs for the failing driver step and error code.";
     } else if (likelyFlatline) {
-        i2sHint = "Mic data looks flat/near-zero. Check CLK/DATA wiring, GND, and 3V3. For Unit PDM use CLK=G1 and DATA=G2.";
+        i2sHint = "Mic data looks flat/near-zero. Check CLK/DATA wiring, GND, and 3V3. Firmware expects CLK=G39 and DATA=G38.";
     } else if (likelyUnsignedPcm) {
         if (currentSampleRate >= 48000) {
             i2sHint = String("PDM path ") + (pdmUseLeftSlot ? "left" : "right") +

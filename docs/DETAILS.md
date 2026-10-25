@@ -9,8 +9,8 @@
 
 ### Pin Configuration
 ```cpp
-I2S_CLK_PIN     = 1   // PDM clock (G1)
-I2S_DATA_IN_PIN = 2   // PDM data (G2)
+I2S_CLK_PIN     = 39  // PDM clock (G39)
+I2S_DATA_IN_PIN = 38  // PDM data (G38)
 WS2812_LED_PIN  = 35  // Built-in RGB LED
 ```
 
