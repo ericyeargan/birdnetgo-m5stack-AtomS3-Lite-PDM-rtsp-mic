@@ -12,18 +12,38 @@ Required:
 - [PDM MEMS Microphone Unit (SPM1423)](https://shop.m5stack.com/products/pdm-microphone-unit-spm1423?variant=35694843134116) - digital MEMS microphone with PDM CLK/DAT output.
 - HY2.0-4P Grove cable, usually included with the PDM Unit.
 
-Wiring with the standard HY2.0 cable:
+Wiring to the AtomS3 Lite header pins:
 
 | PDM Unit wire | PDM Unit signal | AtomS3 Lite pin | Firmware define |
 | --- | --- | --- | --- |
 | Black | GND | GND | - |
 | Red | 5V | 5V | - |
-| Yellow | Data | G2 | `I2S_DATA_IN_PIN = 2` |
-| White | Clock | G1 | `I2S_CLK_PIN = 1` |
+| Yellow | Data | G38 | `I2S_DATA_IN_PIN = 38` |
+| White | Clock | G39 | `I2S_CLK_PIN = 39` |
 
-The AtomS3 Lite HY2.0 pinout maps yellow to `G2` and white to `G1`; the PDM Unit maps yellow to data and white to clock. That is why this firmware uses **CLK=G1** and **DATA=G2**.
+M5Stack's reference wiring plugs the unit into the HY2.0 Grove port, which maps yellow to `G2` and white to `G1`. This firmware uses the header pins instead (**CLK=G39**, **DATA=G38**); change them in `include/MicConfig.h` if you use the Grove port.
 
 Important: `i2sShiftBits` is fixed at `0` for this PDM path. Do not make it configurable. These PDM samples are already 16-bit values; shifting them right can turn normal audio into zeros.
+
+### Alternative Mic: Adafruit SPH0645LM4H I2S Breakout
+
+The [Adafruit I2S MEMS Microphone Breakout (SPH0645LM4H)](https://www.adafruit.com/product/3421) works with a separate build, `m5stack-atoms3-lite-sph0645`. It sends 18-bit I2S PCM, which keeps the ESP32-S3 PDM2PCM filter, the source of the clock-locked tones, out of the audio path. The clock-spur canceller is bypassed in this build.
+
+| Breakout pin | AtomS3 Lite pin | Firmware define |
+| --- | --- | --- |
+| 3V | 3V3 | - |
+| GND | GND | - |
+| BCLK | G5 | `I2S_BCLK_PIN = 5` |
+| LRCL | G6 | `I2S_WS_PIN = 6` |
+| DOUT | G7 | `I2S_DATA_IN_PIN = 7` |
+| SEL | GND | - (left channel) |
+
+```bash
+pio run -e m5stack-atoms3-lite-sph0645 -t upload       # USB
+pio run -e m5stack-atoms3-lite-sph0645-ota -t upload   # OTA
+```
+
+At each I2S start the firmware checks where the 18 data bits land in the 32-bit slot. On the ESP32-S3 the SPH0645 arrives one bit late with standard Philips framing, which drops the sign bit, so the firmware reads it MSB-justified and falls back to Philips framing (normal, then inverted bit clock) only if that check fails. The web log and `/api/audio_status` report the result (`i2s_std_alignment`, which should read `aligned`). `silent` means DOUT reads all zeros: check the wiring and that SEL is tied to GND. The SPH0645 is rated −26 dBFS at 94 dB SPL, so the gain that suits the PDM Unit may need retuning.
 
 ## What Changed From Upstream
 
@@ -32,7 +52,7 @@ Important: `i2sShiftBits` is fixed at `0` for this PDM path. Do not make it conf
 | Main hardware | M5Stack Atom Echo / Atom Voice style device | AtomS3 Lite plus external Unit Mini PDM |
 | PlatformIO board | `m5stack-atom` | `m5stack-atoms3` |
 | MCU family | ESP32-PICO-D4 class Atom hardware | ESP32-S3 AtomS3 Lite |
-| Microphone pins | Onboard Atom Echo/Voice mic pins | External PDM Unit: `G1` clock, `G2` data |
+| Microphone pins | Onboard Atom Echo/Voice mic pins | External PDM Unit: `G39` clock, `G38` data (or SPH0645 build: `G5`/`G6`/`G7`) |
 | LED handling | M5Atom display helpers / Atom LED pin | Arduino RGB LED helper on AtomS3 Lite WS2812 pin `G35` |
 | Hostname | `atomecho.local` | `atoms3mic.local` |
 | Uploads | USB serial | USB serial first, then Arduino OTA on port `3232` |

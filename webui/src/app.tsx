@@ -25,6 +25,7 @@ type Status = {
   rtsp_rejected_clients: number;
   stream_formats: string;
   multi_client_policy: string;
+  mic_model: string;
   hardware_profile: string;
 };
 
@@ -183,6 +184,7 @@ const emptyStatus: Status = {
   rtsp_rejected_clients: 0,
   stream_formats: "RTSP/RTP L16, HTTP L16, AIFF PCM, WebAudio PCM, WAV PCM chunk, JSON PCM",
   multi_client_policy: "bounded_multi_rtsp_tcp",
+  mic_model: "",
   hardware_profile: "PDM input profile"
 };
 
@@ -834,7 +836,7 @@ function App() {
     <main class="shell">
       <section class="topbar">
         <div class="brand-block">
-          <div class="eyebrow">AtomS3 Lite + Unit Mini PDM</div>
+          <div class="eyebrow">AtomS3 Lite{status.mic_model ? ` + ${status.mic_model}` : ""}</div>
           <h1>M5 Atom RTSP Microphone</h1>
           <p>{status.hardware_profile}</p>
         </div>
@@ -934,7 +936,7 @@ function App() {
             <h2>Audio</h2>
             <Pill tone={audio.i2s_driver_ok ? "ok" : "bad"}>{audio.i2s_driver_ok ? "I2S ready" : "I2S fault"}</Pill>
           </div>
-          <Setting label="Sample rate" detail={`${audio.latency_ms.toFixed(1)} ms effective latency • PDM-safe choices`}>
+          <Setting label="Sample rate" detail={`${audio.latency_ms.toFixed(1)} ms effective latency • mic-safe choices`}>
             <select class={controlClass("rate")} value={input("rate", "48000")} onInput={(event) => editDraft("rate", event.currentTarget.value)}>
               {supportedSampleRates.map((rate) => (
                 <option key={rate} value={rate}>{rate}</option>
@@ -981,7 +983,7 @@ function App() {
             </select>
             {setButton("noise_filter")}
           </Setting>
-          <Setting label="LED mode" detail={`PDM shift is fixed at ${audio.i2s_shift} bits`}>
+          <Setting label="LED mode" detail={`Sample shift is fixed at ${audio.i2s_shift} bits`}>
             <select class={controlClass("led_mode")} value={input("led_mode", "1")} onInput={(event) => editDraft("led_mode", event.currentTarget.value)}>
               <option value="0">Off</option>
               <option value="1">Static</option>

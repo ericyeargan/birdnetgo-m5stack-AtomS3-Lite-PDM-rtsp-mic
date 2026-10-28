@@ -7,6 +7,13 @@ See `README.md` for project documentation, features, architecture, and usage.
 - `src/WebUI.cpp` — Web interface (HTML/JS/CSS embedded as string literals, API endpoints)
 - `src/WebUI.h` — WebUI header
 - `platformio.ini` — Build configuration and dependencies
+- `include/MicConfig.h` — Mic selection (`MIC_SPH0645`), pins, `I2sSample` type
+
+## Microphone Builds
+- `m5stack-atoms3-lite` — Unit Mini PDM on the PDM RX driver (CLK=G39, DATA=G38)
+- `m5stack-atoms3-lite-sph0645` — Adafruit SPH0645LM4H on the STD RX driver (BCLK=G5, LRCL=G6, DOUT=G7, SEL=GND), `-DMIC_SPH0645=1`
+  - Measured 2026-10-27: with Philips framing the data lands one bit late (bit 14 never toggles, sign lost); MSB-justified framing (`bit_shift = false`) puts it at bits 31..14. Inverting BCLK doesn't help. The startup probe (`setupSph0645Driver()`) tries MSB-justified first
+- Build both envs after touching capture code
 
 ## Critical Rules
 
@@ -15,6 +22,7 @@ See `README.md` for project documentation, features, architecture, and usage.
 - This is hardcoded to 0 in the firmware — do not make it configurable
 - If it gets set to any other value, all audio becomes zeros (e.g., `180 >> 11 = 0`)
 - Web UI shows it as read-only: "0 bits (fixed for PDM)"
+- The SPH0645 build also keeps it at 0: its 18-bit data in a 32-bit slot is scaled by the fixed `>> 14` in `i2sSampleToFloat()`, not by `i2sShiftBits`
 
 ### Socket Ownership Model
 - Core 1 exclusively owns the WiFiClient socket during streaming
@@ -31,7 +39,8 @@ See `README.md` for project documentation, features, architecture, and usage.
 ### Clock-spur canceller phase must stay locked to the sample count
 - The capture hardware adds pure tones at exact p/q × fs, picked anew at each I2S start; the canceller subtracts the N-sample periodic component (see `docs/CLOCK_SPURS.md`)
 - Its phase must advance once per captured sample — never skip, duplicate, or reorder samples ahead of it without adjusting the phase
-- Samples the I2S driver drops on DMA overflow are counted by the `on_recv_q_ovf` callback (`i2sDmaDroppedSamples`) and skipped over; keep that callback registered
+- Samples the I2S driver drops on DMA overflow are counted by the `on_recv_q_ovf` callback (`i2sDmaDroppedSamples`) and skipped over; keep that callback registered (in both builds; it divides bytes by `sizeof(I2sSample)`)
+- The SPH0645 build bypasses the canceller (`clockSpurPeriodForSampleRate()` returns 0): the tones come from the PDM2PCM filter it doesn't use. Survey with `scripts/find_locked_tones.py` before adding periods for it
 - Each period in `CLOCK_SPUR_CANCEL_PERIODS` must be a multiple of every tone denominator measured at that rate; re-survey before changing one
 
 ## Debugging Tips

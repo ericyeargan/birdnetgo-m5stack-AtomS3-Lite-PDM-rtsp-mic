@@ -6,6 +6,7 @@
 #include <WebServer.h>
 #include "WebUIAssets.h"
 #include "WebUI.h"
+#include "MicConfig.h"
 
 // External variables and functions from main (.ino) – ESP32 RTSP Mic for BirdNET-Go
 extern WiFiServer rtspServer;
@@ -89,6 +90,10 @@ extern volatile bool i2sUsingModernPdmDriver;
 extern volatile bool i2sPdmUseLeftSlot;
 extern volatile bool i2sPdmClkInverted;
 extern volatile bool i2sPdmProbeFoundSigned;
+extern volatile bool i2sUsingStdDriver;
+extern volatile bool i2sStdBclkInverted;
+extern volatile bool i2sStdMsbJustified;
+extern volatile uint8_t i2sStdAlignment;
 extern volatile bool i2sDriverOk;
 extern volatile int32_t i2sLastError;
 extern volatile uint32_t audioFallbackBlockCount;
@@ -656,6 +661,7 @@ static void httpStatus() {
     json += "\"rtsp_rejected_clients\":" + String(rtspRejectedClientCount) + ",";
     json += "\"stream_formats\":\"RTSP/RTP L16, HTTP L16, AIFF PCM, WebAudio PCM, WAV PCM chunk, JSON PCM\",";
     json += "\"multi_client_policy\":\"bounded_multi_rtsp_tcp\",";
+    json += "\"mic_model\":\"" + String(MIC_MODEL_NAME) + "\",";
     json += "\"hardware_profile\":\"" + jsonEscape(describeHardwareProfile()) + "\"";
     json += "}";
     apiSendJSON(json);
@@ -688,6 +694,10 @@ static void httpAudioStatus() {
     bool pdmUseLeftSlot;
     bool pdmClkInverted;
     bool pdmProbeFoundSigned;
+    bool usingStdDriver;
+    bool stdBclkInverted;
+    bool stdMsbJustified;
+    uint8_t stdAlignment;
 
     portENTER_CRITICAL(&diagMux);
     agcMult = agcMultiplier;
@@ -716,6 +726,10 @@ static void httpAudioStatus() {
     pdmUseLeftSlot = i2sPdmUseLeftSlot;
     pdmClkInverted = i2sPdmClkInverted;
     pdmProbeFoundSigned = i2sPdmProbeFoundSigned;
+    usingStdDriver = i2sUsingStdDriver;
+    stdBclkInverted = i2sStdBclkInverted;
+    stdMsbJustified = i2sStdMsbJustified;
+    stdAlignment = i2sStdAlignment;
     portEXIT_CRITICAL(&diagMux);
 
     uint16_t effectiveChunk = effectiveAudioChunkSize();
@@ -738,10 +752,18 @@ static void httpAudioStatus() {
     json += "\"noise_gate_dbfs\":" + String(noiseGate, 1) + ",";
     json += "\"noise_reduction_db\":" + String(noiseReduction, 1) + ",";
     json += "\"filter_chain\":\"" + jsonEscape(describeFilterChain()) + "\",";
+#if MIC_SPH0645
+    String captureMode = usingStdDriver
+        ? String("ESP-IDF STD RX (SPH0645), left slot, ") + (stdMsbJustified ? "msb-justified, " : "philips, ") +
+              (stdBclkInverted ? "inverted" : "normal") +
+              " bclk, alignment " + i2sStdAlignmentName(stdAlignment) + ". "
+        : String("STD RX driver is not active yet. ");
+#else
     String captureMode = usingModernPdmDriver
         ? String("V4 ESP-IDF PDM RX selected ") + (pdmUseLeftSlot ? "left" : "right") +
               " slot" + (pdmClkInverted ? " with inverted clock. " : " with normal clock. ")
         : String("PDM RX driver is not active yet. ");
+#endif
     String filterDetail = captureMode +
         (likelyUnsignedPcm
             ? String("Live blocks still look all-positive, so the unsigned DC tracker and fixed scaling remain active before HPF/gain.")
@@ -775,18 +797,39 @@ static void httpAudioStatus() {
     json += "\"i2s_raw_zero_pct\":" + String(rawZeroPct) + ",";
     json += "\"i2s_raw_mean\":" + String(rawMean) + ",";
     json += "\"i2s_raw_span\":" + String(rawSpan) + ",";
-    json += "\"i2s_capture_driver\":\"" + String(usingModernPdmDriver ? "modern_pdm_rx" : "inactive") + "\",";
+    json += "\"i2s_capture_driver\":\"" + String(usingStdDriver ? "std_rx" : (usingModernPdmDriver ? "modern_pdm_rx" : "inactive")) + "\",";
+    json += "\"i2s_std_bclk_inverted\":" + String(stdBclkInverted?"true":"false") + ",";
+    json += "\"i2s_std_msb_justified\":" + String(stdMsbJustified?"true":"false") + ",";
+    json += "\"i2s_std_alignment\":\"" + String(i2sStdAlignmentName(stdAlignment)) + "\",";
     json += "\"i2s_pdm_slot\":\"" + String(pdmUseLeftSlot ? "left" : "right") + "\",";
     json += "\"i2s_pdm_clk_inverted\":" + String(pdmClkInverted?"true":"false") + ",";
     json += "\"i2s_pdm_probe_signed\":" + String(pdmProbeFoundSigned?"true":"false") + ",";
     json += "\"i2s_unsigned_pcm\":" + String(likelyUnsignedPcm?"true":"false") + ",";
-    bool likelyFlatline = !driverOk || (rawPeakAbs < 8) || ((rawMin == rawMax) && lastSamplesRead > 0) || (rawZeroPct > 98);
+#if MIC_SPH0645
+    // A quiet room can sit under 8 counts at 16-bit scale for this mic, so only
+    // stuck or all-zero data counts as flat (a dead DOUT reads 0 via the pulldown).
+    const bool rawPeakTooLow = false;
+#else
+    const bool rawPeakTooLow = (rawPeakAbs < 8);
+#endif
+    bool likelyFlatline = !driverOk || rawPeakTooLow || ((rawMin == rawMax) && lastSamplesRead > 0) || (rawZeroPct > 98);
     json += "\"i2s_link_ok\":" + String(likelyFlatline?"false":"true") + ",";
     String i2sHint;
     if (!driverOk) {
         i2sHint = "I2S driver setup failed. Check serial logs for the failing driver step and error code.";
     } else if (likelyFlatline) {
-        i2sHint = "Mic data looks flat/near-zero. Check CLK/DATA wiring, GND, and 3V3. Firmware expects CLK=G39 and DATA=G38.";
+        i2sHint = String("Mic data looks flat/near-zero. Check mic wiring, GND, and 3V3. ") + MIC_PIN_HINT;
+#if MIC_SPH0645
+    } else if (stdAlignment != I2S_STD_ALIGN_OK) {
+        i2sHint = String("SPH0645 samples are changing, but the startup check found the data ") +
+                  i2sStdAlignmentName(stdAlignment) + " in its 32-bit slot, so audio may be distorted. " +
+                  "Check BCLK/LRCL wiring and that SEL is tied to GND. " + MIC_PIN_HINT;
+    } else {
+        i2sHint = String("Raw signed I2S samples are changing on the left slot (") +
+                  (stdMsbJustified ? "msb-justified" : "philips") + ", " +
+                  (stdBclkInverted ? "inverted" : "normal") + " bclk); I2S link appears active.";
+    }
+#else
     } else if (likelyUnsignedPcm) {
         if (currentSampleRate >= 48000) {
             i2sHint = String("PDM path ") + (pdmUseLeftSlot ? "left" : "right") +
@@ -803,6 +846,7 @@ static void httpAudioStatus() {
                   (pdmClkInverted ? " / clk-inverted" : " / normal-clock") +
                   " path; I2S link appears active.";
     }
+#endif
     json += "\"i2s_hint\":\"" + jsonEscape(i2sHint) + "\"";
     json += "}";
     apiSendJSON(json);

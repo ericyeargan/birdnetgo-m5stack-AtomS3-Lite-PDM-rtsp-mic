@@ -6,19 +6,24 @@
 #include <esp_err.h>
 #include "driver/i2s_common.h"
 #include "driver/i2s_pdm.h"
+#include "driver/i2s_std.h"
+#include "driver/gpio.h"
 #include <Preferences.h>
 #include <math.h>
 #include <time.h>
 #include <errno.h>
 #include <lwip/sockets.h>
 #include <esp32-hal-rgb-led.h>
+#include "MicConfig.h"
 #include "PdmProbeResult.h"
+#include "Sph0645ProbeResult.h"
 #include "WebUI.h"
 
 // ================== DUAL-CORE AUDIO ARCHITECTURE ==================
 // Core 1: Complete audio pipeline (I2S → process → RTP → WiFi)
 // Core 0: Web UI, diagnostics, RTSP protocol, client management
-// PDM microphone outputs 16-bit samples directly
+// PDM microphone outputs 16-bit samples directly; the SPH0645 build reads
+// 32-bit I2S slots instead (MIC_SPH0645, see MicConfig.h)
 
 enum RtspTransportMode : uint8_t {
     RTSP_TRANSPORT_TCP_INTERLEAVED = 0,
@@ -104,10 +109,7 @@ static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000
 #define OVERHEAT_MAX_LIMIT_C 95
 #define OVERHEAT_LIMIT_STEP_C 5
 
-// -- Pins (AtomS3 Lite + Unit Mini PDM)
-// Mic wired to the header pins (M5's Grove reference wiring is CLK=G1, DATA=G2).
-#define I2S_CLK_PIN     39  // PDM CLK (G39)
-#define I2S_DATA_IN_PIN 38  // PDM DATA (G38)
+// -- Pins: mic pins live in MicConfig.h, chosen per build
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
 struct CRGB {
@@ -196,6 +198,17 @@ uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
 // Typical range: 0-3 for PDM vs 11-13 for I2S microphones
 uint8_t i2sShiftBits = 0;  // Fixed for Unit Mini PDM capture
 
+// Raw capture sample -> 16-bit diagnostics value and DSP input (16-bit full scale).
+#if MIC_SPH0645
+// The SPH0645 alignment is fixed by its slot format, not by i2sShiftBits:
+// >> 14 keeps all 18 data bits and drops the pad and tri-state bits.
+static inline int16_t i2sRaw16(I2sSample s) { return (int16_t)(s >> 16); }
+static inline float i2sSampleToFloat(I2sSample s) { return (float)(s >> 14) * 0.25f; }
+#else
+static inline int16_t i2sRaw16(I2sSample s) { return s; }
+static inline float i2sSampleToFloat(I2sSample s) { return (float)(s >> i2sShiftBits); }
+#endif
+
 // -- Audio metering / clipping diagnostics
 uint16_t lastPeakAbs16 = 0;       // last block peak absolute value (0..32767)
 uint32_t audioClipCount = 0;      // total blocks where clipping occurred
@@ -223,6 +236,10 @@ volatile bool i2sUsingModernPdmDriver = false;
 volatile bool i2sPdmUseLeftSlot = false;
 volatile bool i2sPdmClkInverted = false;
 volatile bool i2sPdmProbeFoundSigned = false;
+volatile bool i2sUsingStdDriver = false;     // SPH0645 build: ESP-IDF STD RX active
+volatile bool i2sStdBclkInverted = false;
+volatile bool i2sStdMsbJustified = false;
+volatile uint8_t i2sStdAlignment = I2S_STD_ALIGN_UNKNOWN;
 volatile bool i2sDriverOk = false;
 volatile int32_t i2sLastError = ESP_OK;
 static i2s_chan_handle_t i2sRxChannel = NULL;
@@ -300,8 +317,15 @@ const uint8_t PDM_UNSIGNED_CONFIDENCE_OFF = 2;
 const uint16_t PDM_PROBE_SETTLE_MS = 650;
 const uint8_t PDM_PROBE_MEASURE_READS = 5;
 const char* DEVICE_TITLE = "M5 Atom RTSP Microphone";
+#if MIC_SPH0645
+const uint16_t SPH0645_PROBE_SETTLE_MS = 300;
+const uint8_t SPH0645_PROBE_MEASURE_READS = 5;
+const char* DEVICE_INPUT_PROFILE = "I2S input profile (AtomS3 Lite + SPH0645LM4H)";
+const char* FILTER_CHAIN_BASE = "I2S PCM (18-bit) -> 2nd-order Butterworth high-pass -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
+#else
 const char* DEVICE_INPUT_PROFILE = "PDM input profile (AtomS3 Lite + Unit Mini PDM tuned)";
 const char* FILTER_CHAIN_BASE = "PDM PCM -> stable DC normalize when needed -> 2nd-order Butterworth high-pass -> clock-spur canceller -> optional noise bed suppressor -> manual gain -> limiter -> optional AGC";
+#endif
 
 // -- High-pass filter (biquad) to cut low-frequency rumble
 struct Biquad {
@@ -366,6 +390,12 @@ constexpr bool clockSpurPeriodsFit(size_t i = 0) {
 static_assert(clockSpurPeriodsFit(), "clock-spur period exceeds CLOCK_SPUR_CANCEL_MAX_PERIOD");
 
 uint16_t clockSpurPeriodForSampleRate(uint32_t sampleRate) {
+#if MIC_SPH0645
+    // The tones come from the ESP32-S3 PDM2PCM filter, which this mic bypasses.
+    // Not yet surveyed on this hardware; see docs/CLOCK_SPURS.md before adding periods.
+    (void)sampleRate;
+    return 0;
+#endif
     for (const ClockSpurPeriod& entry : CLOCK_SPUR_CANCEL_PERIODS) {
         if (entry.sampleRate == sampleRate) return entry.period;
     }
@@ -607,10 +637,13 @@ String describeFilterChain() {
     chain += highpassEnabled
         ? (String(" (HPF ON @ ") + String(highpassCutoffHz) + " Hz)")
         : String(" (HPF bypassed)");
+#if !MIC_SPH0645
+    // The SPH0645 build has no canceller stage (no PDM2PCM tones to remove).
     uint16_t spurPeriod = clockSpurPeriodForSampleRate(currentSampleRate);
     chain += spurPeriod
         ? (String(", clock-spur canceller (period ") + String(spurPeriod) + " samples)")
         : String(", clock-spur canceller bypassed (no period for this rate)");
+#endif
     chain += noiseFilterEnabled
         ? String(", noise suppressor active")
         : String(", noise suppressor bypassed");
@@ -1585,7 +1618,7 @@ void audioCaptureTask(void* parameter) {
 
     const uint16_t chunkSamples = effectiveAudioChunkSize();
     const uint16_t readBufferSamples = computeI2sReadBufferSamples();
-    int16_t* captureBuffer = (int16_t*)malloc(readBufferSamples * sizeof(int16_t));
+    I2sSample* captureBuffer = (I2sSample*)malloc(readBufferSamples * sizeof(I2sSample));
     int16_t* outputBuffer = (int16_t*)malloc(readBufferSamples * sizeof(int16_t));
 
     if (!captureBuffer || !outputBuffer) {
@@ -1639,9 +1672,13 @@ void audioCaptureTask(void* parameter) {
     unsigned long lastGoodCaptureMs = millis();
     int16_t lastOutputSample = 0;
     bool lastBlockWasConcealment = false;
+#if MIC_SPH0645
+    const bool localUnsignedPdm = false;  // I2S PCM is always signed
+#else
     bool localUnsignedPdm = false;
     bool localPdmDcInitialized = false;
     uint8_t localUnsignedPdmConfidence = 0;
+#endif
     float localPdmDc = 0.0f;
     const uint32_t readTimeoutMs = max(20UL, min(200UL,
         ((unsigned long)readBufferSamples * 1000UL) / max((uint32_t)1, currentSampleRate) + 10UL));
@@ -1678,7 +1715,7 @@ void audioCaptureTask(void* parameter) {
 
         // Read from I2S with a cadence-aware timeout so concealment can kick in
         esp_err_t result = i2sMicRead(captureBuffer,
-                                      readBufferSamples * sizeof(int16_t),
+                                      readBufferSamples * sizeof(I2sSample),
                                       &bytesRead, readTimeoutMs);
         unsigned long processStartUs = micros();
 
@@ -1727,7 +1764,7 @@ void audioCaptureTask(void* parameter) {
         consecutiveErrors = 0;
         i2sReadOkCount = i2sReadOkCount + 1U;
         lastGoodCaptureMs = millis();
-        uint16_t samplesRead = bytesRead / sizeof(int16_t);
+        uint16_t samplesRead = bytesRead / sizeof(I2sSample);
         uint32_t droppedNow = i2sDmaDroppedSamples;
         if (droppedNow != localDmaDroppedSamples) {
             // Dropped buffers are always older than this read, so they belong
@@ -1789,7 +1826,7 @@ void audioCaptureTask(void* parameter) {
 
         // First pass: collect raw stats for diagnostics and format detection.
         for (int i = 0; i < samplesRead; i++) {
-            int16_t raw = captureBuffer[i];
+            int16_t raw = i2sRaw16(captureBuffer[i]);
             if (raw < rawMin) rawMin = raw;
             if (raw > rawMax) rawMax = raw;
             uint16_t rawAbs = (raw < 0) ? (uint16_t)(-raw) : (uint16_t)raw;
@@ -1801,6 +1838,8 @@ void audioCaptureTask(void* parameter) {
 
         float rawMean = (samplesRead > 0) ? (rawSum / (float)samplesRead) : 0.0f;
         int32_t rawSpan = (rawMax >= rawMin) ? ((int32_t)rawMax - (int32_t)rawMin) : 0;
+#if !MIC_SPH0645
+        // Unit Mini PDM only: an all-positive stream gets recentered before DSP.
         bool unsignedCandidate = (samplesRead > 0 &&
                                   rawMin >= 0 &&
                                   rawMax <= (int16_t)PDM_UNSIGNED_MAX_CODE &&
@@ -1835,6 +1874,7 @@ void audioCaptureTask(void* parameter) {
         portENTER_CRITICAL(&diagMux);
         i2sLikelyUnsignedPcm = localUnsignedPdm;
         portEXIT_CRITICAL(&diagMux);
+#endif
 
         float pdmDcAlpha = 0.0f;
         if (localUnsignedPdm) {
@@ -1845,10 +1885,9 @@ void audioCaptureTask(void* parameter) {
 
         // Second pass: DSP and output generation.
         for (int i = 0; i < samplesRead; i++) {
-            int16_t raw = captureBuffer[i];
-
             float sample;
             if (localUnsignedPdm) {
+                int16_t raw = i2sRaw16(captureBuffer[i]);
                 // Keep unsigned-PDM scaling fixed per center band so weak all-positive
                 // blocks do not get over-amplified into gritty/raspy audio.
                 float unsignedNormalizeGain =
@@ -1858,7 +1897,7 @@ void audioCaptureTask(void* parameter) {
                 localPdmDc += ((float)raw - localPdmDc) * pdmDcAlpha;
                 sample = ((float)raw - localPdmDc) * unsignedNormalizeGain;
             } else {
-                sample = (float)(raw >> i2sShiftBits);
+                sample = i2sSampleToFloat(captureBuffer[i]);
             }
 
             if (localHighpassEnabled) {
@@ -2230,7 +2269,8 @@ static esp_err_t i2sMicRead(void* dest, size_t size, size_t* bytesRead, uint32_t
     return i2s_channel_read(i2sRxChannel, dest, size, bytesRead, timeoutMs);
 }
 
-// I2S setup for AtomS3 Lite + Unit Mini PDM using the ESP-IDF 5 PDM RX channel driver.
+// I2S setup: Unit Mini PDM on the ESP-IDF 5 PDM RX channel driver, or the
+// SPH0645 on the standard (Philips) RX driver when MIC_SPH0645 is set.
 static void shutdownModernI2sDriver() {
     if (!i2sRxChannel) {
         return;
@@ -2248,6 +2288,7 @@ static void shutdownModernI2sDriver() {
     i2sRxChannel = NULL;
 }
 
+#if !MIC_SPH0645
 static i2s_pdm_slot_mask_t pdmLine0SlotMask(bool useLeftSlot) {
 #if SOC_I2S_PDM_MAX_RX_LINES > 1
     return useLeftSlot ? I2S_PDM_RX_LINE0_SLOT_LEFT : I2S_PDM_RX_LINE0_SLOT_RIGHT;
@@ -2255,14 +2296,16 @@ static i2s_pdm_slot_mask_t pdmLine0SlotMask(bool useLeftSlot) {
     return useLeftSlot ? I2S_PDM_SLOT_LEFT : I2S_PDM_SLOT_RIGHT;
 #endif
 }
+#endif
 
 static bool IRAM_ATTR onI2sRecvQueueOverflow(i2s_chan_handle_t handle, i2s_event_data_t* event, void* userCtx) {
     (void)handle;
     (void)userCtx;
-    i2sDmaDroppedSamples = i2sDmaDroppedSamples + (uint32_t)(event->size / sizeof(int16_t));
+    i2sDmaDroppedSamples = i2sDmaDroppedSamples + (uint32_t)(event->size / sizeof(I2sSample));
     return false;
 }
 
+#if !MIC_SPH0645
 static bool setupModernPdmDriverCandidate(uint16_t dmaBufLen, uint8_t dmaBufCount,
                                           bool useLeftSlot, bool clkInvert,
                                           bool verboseLogs) {
@@ -2485,6 +2528,219 @@ static bool setupModernPdmDriver(uint16_t dmaBufLen, uint8_t dmaBufCount) {
     return true;
 }
 
+#else  // MIC_SPH0645
+
+static bool setupSph0645Candidate(uint16_t dmaBufLen, uint8_t dmaBufCount,
+                                  bool bclkInvert, bool msbJustified, bool verboseLogs) {
+    shutdownModernI2sDriver();
+
+    i2s_chan_config_t chanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chanConfig.dma_desc_num = dmaBufCount;
+    chanConfig.dma_frame_num = dmaBufLen;
+
+    esp_err_t err = i2s_new_channel(&chanConfig, NULL, &i2sRxChannel);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        if (verboseLogs) {
+            simplePrintln("ERROR: I2S new_channel failed: " + String(esp_err_to_name(err)));
+        }
+        i2sRxChannel = NULL;
+        return false;
+    }
+
+    // 32-bit slots, both slots clocked: BCLK = 64 * fs (1.024-3.072 MHz across
+    // the supported rates, inside the SPH0645's 1.024-4.096 MHz range).
+    i2s_std_config_t stdConfig = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {}
+    };
+    stdConfig.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;  // SEL tied to GND
+    // Philips framing delays the MSB one BCLK after the WS edge; MSB-justified
+    // samples one bit earlier, which corrects a mic that lands one bit late.
+    stdConfig.slot_cfg.bit_shift = !msbJustified;
+    stdConfig.gpio_cfg.mclk = I2S_GPIO_UNUSED;
+    stdConfig.gpio_cfg.bclk = (gpio_num_t)I2S_BCLK_PIN;
+    stdConfig.gpio_cfg.ws = (gpio_num_t)I2S_WS_PIN;
+    stdConfig.gpio_cfg.dout = I2S_GPIO_UNUSED;
+    stdConfig.gpio_cfg.din = (gpio_num_t)I2S_DATA_IN_PIN;
+    stdConfig.gpio_cfg.invert_flags.mclk_inv = 0;
+    stdConfig.gpio_cfg.invert_flags.bclk_inv = bclkInvert ? 1 : 0;
+    stdConfig.gpio_cfg.invert_flags.ws_inv = 0;
+
+    err = i2s_channel_init_std_mode(i2sRxChannel, &stdConfig);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        if (verboseLogs) {
+            simplePrintln("ERROR: I2S STD RX init failed: " + String(esp_err_to_name(err)));
+        }
+        shutdownModernI2sDriver();
+        return false;
+    }
+    // The mic tri-states DOUT outside its 18+6 bit-times and during the right
+    // slot; pull it down so those bits read 0 instead of floating.
+    gpio_pulldown_en((gpio_num_t)I2S_DATA_IN_PIN);
+
+    // Count the samples the driver drops on DMA queue overflow, so the
+    // clock-spur canceller can advance its phase past them.
+    i2s_event_callbacks_t callbacks = {};
+    callbacks.on_recv_q_ovf = onI2sRecvQueueOverflow;
+    err = i2s_channel_register_event_callback(i2sRxChannel, &callbacks, NULL);
+    if (err != ESP_OK && verboseLogs) {
+        simplePrintln("WARNING: I2S overflow callback not registered: " + String(esp_err_to_name(err)));
+    }
+
+    err = i2s_channel_enable(i2sRxChannel);
+    if (err != ESP_OK) {
+        i2sLastError = err;
+        if (verboseLogs) {
+            simplePrintln("ERROR: I2S channel enable failed: " + String(esp_err_to_name(err)));
+        }
+        shutdownModernI2sDriver();
+        return false;
+    }
+
+    i2sLastError = ESP_OK;
+    return true;
+}
+
+// Checks where the 18 data bits land in the 32-bit slot. The data LSB (bit 14)
+// carries mic noise and toggles about half the time, while the driven pad bits
+// 13..8 are always 0. One bit late moves the toggling to bit 15 and loses the
+// sign bit; one bit early puts the LSB into the pad.
+static Sph0645ProbeResult probeSph0645Candidate(uint16_t dmaBufLen, uint8_t dmaBufCount,
+                                                bool bclkInvert, bool msbJustified,
+                                                int32_t* probeBuffer, uint16_t probeSamples) {
+    Sph0645ProbeResult result;
+    result.bclkInvert = bclkInvert;
+    result.msbJustified = msbJustified;
+    String label = String(msbJustified ? "msb-justified" : "philips") +
+                   (bclkInvert ? ", bclk inverted" : ", normal bclk");
+
+    if (!probeBuffer || probeSamples == 0) {
+        return result;
+    }
+    if (!setupSph0645Candidate(dmaBufLen, dmaBufCount, bclkInvert, msbJustified, false)) {
+        simplePrintln("SPH0645 probe " + label + " setup failed: " +
+                      String(esp_err_to_name((esp_err_t)i2sLastError)));
+        return result;
+    }
+
+    size_t bytesRead = 0;
+    unsigned long settleUntil = millis() + SPH0645_PROBE_SETTLE_MS;
+    do {
+        (void)i2sMicRead(probeBuffer, probeSamples * sizeof(int32_t), &bytesRead, 80);
+    } while (millis() < settleUntil);
+
+    result.alwaysSetMask = 0xFFFFFFFFUL;
+    for (uint8_t pass = 0; pass < SPH0645_PROBE_MEASURE_READS; ++pass) {
+        esp_err_t err = i2sMicRead(probeBuffer, probeSamples * sizeof(int32_t), &bytesRead, 80);
+        if (err != ESP_OK || bytesRead == 0) {
+            continue;
+        }
+        uint16_t samples = (uint16_t)(bytesRead / sizeof(int32_t));
+        for (uint16_t i = 0; i < samples; ++i) {
+            uint32_t word = (uint32_t)probeBuffer[i];
+            if (word & (1UL << 14)) result.lsbSetCount++;
+            if (word & (1UL << 15)) result.bit15SetCount++;
+            if (word & 0x3F00UL) result.padSetCount++;
+            if (word != 0) result.nonzeroCount++;
+            result.everSetMask |= word;
+            result.alwaysSetMask &= word;
+        }
+        result.samples += samples;
+    }
+
+    if (result.samples == 0) {
+        simplePrintln("SPH0645 probe " + label + " yielded no audio blocks");
+        return result;
+    }
+
+    result.valid = true;
+    const uint32_t n = result.samples;
+    if (result.nonzeroCount == 0) {
+        result.alignment = I2S_STD_ALIGN_SILENT;
+    } else if (result.padSetCount > n / 100U) {
+        result.alignment = I2S_STD_ALIGN_EARLY;
+    } else if (result.lsbSetCount == 0 && result.bit15SetCount > 0) {
+        result.alignment = I2S_STD_ALIGN_LATE;
+    } else if (result.lsbSetCount >= n / 20U && result.lsbSetCount <= n - n / 20U) {
+        result.alignment = I2S_STD_ALIGN_OK;
+    } else {
+        result.alignment = I2S_STD_ALIGN_UNKNOWN;
+    }
+    simplePrintln("SPH0645 probe " + label + ": " + String(i2sStdAlignmentName(result.alignment)) +
+                  " (n " + String(n) +
+                  ", b14 " + String(result.lsbSetCount) +
+                  ", b15 " + String(result.bit15SetCount) +
+                  ", pad " + String(result.padSetCount) +
+                  ", nonzero " + String(result.nonzeroCount) +
+                  ", set 0x" + String(result.everSetMask, HEX) +
+                  ", always 0x" + String(result.alwaysSetMask, HEX) + ")");
+    return result;
+}
+
+static bool setupSph0645Driver(uint16_t dmaBufLen, uint8_t dmaBufCount) {
+    uint16_t probeSamples = computeI2sReadBufferSamples();
+    if (probeSamples < 64) {
+        probeSamples = 64;
+    }
+
+    bool bclkInvert = false;
+    bool msbJustified = true;
+    uint8_t alignment = I2S_STD_ALIGN_UNKNOWN;
+    int32_t* probeBuffer = (int32_t*)malloc(probeSamples * sizeof(int32_t));
+    if (!probeBuffer) {
+        simplePrintln("SPH0645 probe could not allocate scratch buffer; using msb-justified, normal bclk");
+    } else {
+        Sph0645ProbeResult first;
+        // {bclk inverted, msb-justified}. On the ESP32-S3 the SPH0645 lands one bit
+        // late with Philips framing (bit 14 never toggles, sign bit lost), so
+        // MSB-justified goes first; Philips, as the datasheet specifies, is the fallback.
+        const bool options[][2] = {{false, true}, {false, false}, {true, false}};
+        for (uint8_t i = 0; i < sizeof(options) / sizeof(options[0]); ++i) {
+            Sph0645ProbeResult probe = probeSph0645Candidate(dmaBufLen, dmaBufCount,
+                                                             options[i][0], options[i][1],
+                                                             probeBuffer, probeSamples);
+            if (i == 0) first = probe;
+            if (probe.valid && probe.alignment == I2S_STD_ALIGN_OK) {
+                bclkInvert = probe.bclkInvert;
+                msbJustified = probe.msbJustified;
+                alignment = probe.alignment;
+                break;
+            }
+        }
+        free(probeBuffer);
+        if (alignment != I2S_STD_ALIGN_OK) {
+            alignment = first.valid ? first.alignment : I2S_STD_ALIGN_UNKNOWN;
+            msbJustified = true;
+            simplePrintln("WARNING: SPH0645 data not aligned with any framing (msb-justified, normal bclk: " +
+                          String(i2sStdAlignmentName(alignment)) + "); using msb-justified, normal bclk. " + MIC_PIN_HINT);
+        }
+    }
+
+    if (!setupSph0645Candidate(dmaBufLen, dmaBufCount, bclkInvert, msbJustified, true)) {
+        return false;
+    }
+
+    i2sUsingStdDriver = true;
+    i2sStdBclkInverted = bclkInvert;
+    i2sStdMsbJustified = msbJustified;
+    i2sStdAlignment = alignment;
+    i2sDriverOk = true;
+    i2sLastError = ESP_OK;
+    simplePrintln("I2S ready (ESP-IDF STD RX, SPH0645): " + String(currentSampleRate) + "Hz, gain " +
+                  String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
+                  " (chunk " + String(effectiveAudioChunkSize()) + ")" +
+                  ", dma " + String(dmaBufCount) + "x" + String(dmaBufLen) +
+                  ", read " + String(computeI2sReadBufferSamples()) +
+                  ", left slot, " + String(msbJustified ? "msb-justified" : "philips") +
+                  (bclkInvert ? ", bclk inverted" : ", normal bclk") +
+                  ", alignment " + String(i2sStdAlignmentName(alignment)));
+    return true;
+}
+#endif  // MIC_SPH0645
+
 void setup_i2s_driver() {
     i2sDriverOk = false;
     i2sLastError = ESP_OK;
@@ -2493,12 +2749,20 @@ void setup_i2s_driver() {
     i2sPdmUseLeftSlot = false;
     i2sPdmClkInverted = false;
     i2sPdmProbeFoundSigned = false;
+    i2sUsingStdDriver = false;
+    i2sStdBclkInverted = false;
+    i2sStdMsbJustified = false;
+    i2sStdAlignment = I2S_STD_ALIGN_UNKNOWN;
 
     const uint16_t dma_buf_len = computeI2sDmaBufferLen();
     const uint8_t dma_buf_count = computeI2sDmaBufferCount();
     shutdownModernI2sDriver();
 
+#if MIC_SPH0645
+    (void)setupSph0645Driver(dma_buf_len, dma_buf_count);
+#else
     (void)setupModernPdmDriver(dma_buf_len, dma_buf_count);
+#endif
 }
 
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len, unsigned long timeoutMs) {
