@@ -7,3 +7,4 @@ webui/node_modules/
 include/GitVersion.h
 .idea/
 compile_commands.json
+.cache/
